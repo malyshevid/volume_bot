@@ -1,6 +1,5 @@
 import dotenv from 'dotenv';
 import bs58 from 'bs58';
-import fetch from 'node-fetch';
 import {
   Connection,
   Keypair,
@@ -12,7 +11,7 @@ import {
 import {
   Liquidity,
   Token,
-  jsonInfo2PoolKeys,
+  MAINNET_PROGRAM_ID,
 } from '@raydium-io/raydium-sdk';
 import {
   getAssociatedTokenAddressSync,
@@ -92,160 +91,18 @@ dotenv.config();
   ];
 
   // ---------------- Получение пулов ----------------
-  const RAY_V3 = 'https://api-v3.raydium.io';
-  const RAY_V2_BASE = 'https://api.raydium.io/v2/sdk/liquidity';
-  const JUP_QUOTE = 'https://quote-api.jup.ag/v6/quote';
   const poolMap = new Map<string, any>();
   const wsolMintStr = Token.WSOL.mint.toBase58();
 
-  async function fetchJson<T = any>(url: string, timeoutMs = 10000): Promise<T> {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, { signal: controller.signal } as any);
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-      return res.json() as Promise<T>;
-    } finally {
-      clearTimeout(id);
-    }
-  }
-
-  // v3: попытка найти пул по паре mint ↔ WSOL
-  async function tryV3Resolve(mint: string): Promise<any | undefined> {
-    const tryUrls = [
-      `${RAY_V3}/pools/info/mint?mints=${mint},${wsolMintStr}`,
-      `${RAY_V3}/pools/info/mint?mint1=${mint}&mint2=${wsolMintStr}`,
-      `${RAY_V3}/pools/info/mint?mint1=${wsolMintStr}&mint2=${mint}`,
-    ];
-    for (const u of tryUrls) {
-      try {
-        const infoResp: any = await fetchJson(u);
-        const pools: any[] = Array.isArray(infoResp?.data)
-          ? infoResp.data
-          : (infoResp?.pools || infoResp || []);
-        if (!pools?.length) continue;
-        const target = pools.find((p: any) => {
-          const base = p.baseMint || p.base?.mint;
-          const quote = p.quoteMint || p.quote?.mint;
-          return (base === mint && quote === wsolMintStr) || (quote === mint && base === wsolMintStr);
-        }) || pools[0];
-        if (!target) continue;
-
-        const poolId = target.id || target.poolId || target.ammId;
-        if (!poolId) continue;
-
-        const keysResp: any = await fetchJson(`${RAY_V3}/pools/key/ids?ids=${poolId}`);
-        const kd = Array.isArray(keysResp?.data) ? keysResp.data[0] : (keysResp?.data || keysResp)[0] || keysResp;
-
-        const jsonLike = {
-          id: poolId,
-          baseMint: (target.baseMint || target.base?.mint),
-          quoteMint: (target.quoteMint || target.quote?.mint),
-          lpMint: target.lpMint || kd?.lpMint,
-          openOrders: kd?.openOrders,
-          targetOrders: kd?.targetOrders,
-          marketId: kd?.marketId,
-          marketProgramId: kd?.marketProgramId,
-          authority: kd?.authority,
-          ammId: kd?.ammId || poolId,
-          ammOpenOrders: kd?.ammOpenOrders,
-          ammTargetOrders: kd?.ammTargetOrders,
-          poolCoinTokenAccount: kd?.poolCoinTokenAccount,
-          poolPcTokenAccount: kd?.poolPcTokenAccount,
-          serumProgramId: kd?.serumProgramId || kd?.marketProgramId,
-          programId: kd?.programId || kd?.ammProgramId,
-        };
-
-        return jsonInfo2PoolKeys(jsonLike as any);
-      } catch {
-        // next
-      }
-    }
-    return undefined;
-  }
-
-  // v2: небольшой JSON-список ammV4/clmm как фоллбэк
-  async function tryV2Resolve(mint: string): Promise<any | undefined> {
-    const urls = [
-      `${RAY_V2_BASE}/ammV4.json`,
-      `${RAY_V2_BASE}/clmm.json`,
-    ];
-    for (const u of urls) {
-      try {
-        const data: any = await fetchJson(u);
-        const list = Array.isArray(data?.data) ? data.data : data;
-        if (!Array.isArray(list)) continue;
-
-        const info = list.find((p: any) =>
-          (p.baseMint === mint && p.quoteMint === wsolMintStr) ||
-          (p.quoteMint === mint && p.baseMint === wsolMintStr)
-        );
-        if (info) return jsonInfo2PoolKeys(info);
-      } catch {
-        // next
-      }
-    }
-    return undefined;
-  }
-
-  // Jupiter: берём прямой маршрут и вытаскиваем Raydium poolId → ключи Raydium
-  async function tryJupiterResolve(mint: string): Promise<any | undefined> {
-    try {
-      const url = `${JUP_QUOTE}?inputMint=${mint}&outputMint=${wsolMintStr}&onlyDirectRoutes=true&swapMode=ExactIn`;
-      const j: any = await fetchJson(url, 10000);
-
-      const quotes: any[] = Array.isArray(j?.data) ? j.data : [];
-      for (const q of quotes) {
-        const mis: any[] = Array.isArray(q?.marketInfos) ? q.marketInfos : [];
-        for (const mi of mis) {
-          const amm = (mi?.amm || mi?.label || '').toString().toLowerCase();
-          if (!amm.includes('raydium')) continue;
-
-          const poolId = mi?.id || mi?.poolAddress || mi?.address || mi?.ammId;
-          if (!poolId) continue;
-
-          try {
-            const keysResp: any = await fetchJson(`${RAY_V3}/pools/key/ids?ids=${poolId}`);
-            const kd = Array.isArray(keysResp?.data) ? keysResp.data[0] : (keysResp?.data || keysResp)[0] || keysResp;
-
-            const jsonLike = {
-              id: poolId,
-              baseMint: mi?.inputMint ?? mint,
-              quoteMint: mi?.outputMint ?? wsolMintStr,
-              lpMint: kd?.lpMint,
-              openOrders: kd?.openOrders,
-              targetOrders: kd?.targetOrders,
-              marketId: kd?.marketId,
-              marketProgramId: kd?.marketProgramId,
-              authority: kd?.authority,
-              ammId: kd?.ammId || poolId,
-              ammOpenOrders: kd?.ammOpenOrders,
-              ammTargetOrders: kd?.ammTargetOrders,
-              poolCoinTokenAccount: kd?.poolCoinTokenAccount,
-              poolPcTokenAccount: kd?.poolPcTokenAccount,
-              serumProgramId: kd?.serumProgramId || kd?.marketProgramId,
-              programId: kd?.programId || kd?.ammProgramId,
-            };
-
-            return jsonInfo2PoolKeys(jsonLike as any);
-          } catch {
-            // try next marketInfo
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return undefined;
-  }
-
+  const allPools = await Liquidity.fetchAllPoolKeys(connection, MAINNET_PROGRAM_ID);
   for (const mint of TOKENS) {
-    let poolKeys: any | undefined = await tryV3Resolve(mint);
-    if (!poolKeys) poolKeys = await tryV2Resolve(mint);
-    if (!poolKeys) poolKeys = await tryJupiterResolve(mint);
-
-    if (poolKeys) {
-      poolMap.set(mint, poolKeys);
+    const found = allPools.find(
+      p =>
+        (p.baseMint.toBase58() === mint && p.quoteMint.toBase58() === wsolMintStr) ||
+        (p.quoteMint.toBase58() === mint && p.baseMint.toBase58() === wsolMintStr),
+    );
+    if (found) {
+      poolMap.set(mint, found);
       console.log('✅ Pool resolved for', mint);
     } else {
       console.warn('⚠️ Pool not found for', mint);
