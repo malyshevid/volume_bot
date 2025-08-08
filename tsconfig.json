@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",      // 👈 ОБЯЗАТЕЛЬНО
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
