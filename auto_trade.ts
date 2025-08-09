@@ -65,7 +65,6 @@ function readWallets(file = path.resolve(__dirname, 'wallets.txt')): string[] {
   const valid: string[] = [];
   for (const raw of lines) {
     try {
-      // валидация: пробуем собрать Keypair
       const secret = raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw);
       Keypair.fromSecretKey(secret);
       valid.push(raw); // храним исходную строку, будем подставлять её в PRIVATE_KEY
@@ -139,24 +138,39 @@ async function getTokenBalanceRaw(connection: Connection, owner: PublicKey, mint
   return total;
 }
 
+// === SOAX proxy config (rotating session: новый IP на каждый запрос) ===
+// (Оставляем имена переменных как были, чтобы не трогать остальной код)
+const BRD_HOST = 'proxy.soax.com';
+const BRD_PORT = 5000;
+const BRD_USER_BASE = 'package-309846';
+const BRD_PASS = '5AYenIcT9SWBsZco';
+
+// строим прокси-URL (для SOAX rotating — без session в логине)
+function buildProxyUrl(pubkey: string) {
+  const session = `rot-${Date.now().toString(36)}`; // чисто для лога
+  const username = BRD_USER_BASE; // у SOAX rotating сессия не нужна в логине
+  const proxyUrl = `http://${encodeURIComponent(username)}:${encodeURIComponent(BRD_PASS)}@${BRD_HOST}:${BRD_PORT}`;
+  return { proxyUrl, session };
+}
+
 // --- Надёжный запуск trade_token.ts (фикс ENOENT) ---
 function resolveTsNodeBin(): string {
   const local = path.join(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'ts-node.cmd' : 'ts-node');
   if (fs.existsSync(local)) return local;
-  // fallback: глобальный командой через shell
   return process.platform === 'win32' ? 'ts-node.cmd' : 'ts-node';
 }
 
-function runTradeScript(op: 'buy' | 'sell', tokenMint: string, amountSol: number): Promise<void> {
+// ⬇️ изменено: amount теперь строка (для SELL передаём raw-кол-во токена)
+function runTradeScript(op: 'buy' | 'sell', tokenMint: string, amount: string, envExtras: Record<string, string>): Promise<void> {
   return new Promise((resolve, reject) => {
     const tsNodeBin = resolveTsNodeBin();
-    const args = [TRADE_SCRIPT, op, tokenMint, amountSol.toString()];
+    const args = [TRADE_SCRIPT, op, tokenMint, amount];
     console.log('▶️  run:', tsNodeBin, args.join(' '));
 
     const child = spawn(tsNodeBin, args, {
       stdio: 'inherit',
       shell: true, // важно для Windows (.cmd)
-      env: process.env,
+      env: { ...process.env, ...envExtras },
     });
     child.on('exit', code => {
       if (code === 0) resolve();
@@ -176,20 +190,27 @@ async function mainLoop() {
       // шаг 1: действие
       const op: 'buy' | 'sell' = Math.random() < 0.5 ? 'buy' : 'sell';
 
-      // шаг 2: токен
-      const tokenMint = tokens[Math.floor(Math.random() * tokens.length)];
+      // шаг 2: токен (используется для BUY; для SELL ниже возьмём реальный из кошелька)
+      const tokenMintFromList = tokens[Math.floor(Math.random() * tokens.length)];
 
-      // ➕ шаг 0.5: выбираем кошелёк из wallets.txt
+      // шаг 0.5: выбираем кошелёк из wallets.txt
       const walletRaw = wallets[Math.floor(Math.random() * wallets.length)];
       const wallet = parseKeypairFromString(walletRaw);
-      console.log(`\n=== ${new Date().toISOString()} | ${op.toUpperCase()} | ${tokenMint.slice(0, 8)}... | WALLET ${wallet.publicKey.toBase58().slice(0,8)}… ===`);
+      const pub = wallet.publicKey.toBase58();
+      console.log(`\n=== ${new Date().toISOString()} | ${op.toUpperCase()} | ${tokenMintFromList.slice(0, 8)}... | WALLET ${pub.slice(0,8)}… ===`);
 
-      // Подставляем выбранный приватный ключ в процесс-окружение,
-      // чтобы trade_token.ts использовал нужный кошелёк
-      process.env.PRIVATE_KEY = walletRaw;
+      // Настраиваем прокси (SOAX rotating)
+      const { proxyUrl, session } = buildProxyUrl(pub);
+      console.log(`🛰️ Proxy enabled: ${BRD_HOST}:${BRD_PORT} | session=${session}`);
+
+      // Переменные окружения для дочернего процесса трейда
+      const childEnv = {
+        PRIVATE_KEY: walletRaw,
+        HTTPS_PROXY: proxyUrl,
+      };
 
       if (op === 'buy') {
-        // шаг 3 (buy): баланс SOL выбранного кошелька, выбираем долю и покупаем
+        // баланс SOL -> доля -> покупка (токен из tokens.txt)
         const balLamports = await connection.getBalance(wallet.publicKey);
         const feeBuffer = 300_000; // ~0.0003 SOL на комиссии
         const available = Math.max(0, balLamports - feeBuffer);
@@ -200,24 +221,43 @@ async function mainLoop() {
           const spendLamports = Math.max(500_000, Math.floor(available * frac)); // ≥ 0.0005 SOL
           const amountSOL = spendLamports / 1e9;
           console.log(`💰 Buying for ~${amountSOL.toFixed(6)} SOL (balance ${(balLamports/1e9).toFixed(6)} SOL)…`);
-          await runTradeScript('buy', tokenMint, Number(amountSOL.toFixed(9)));
+          await runTradeScript('buy', tokenMintFromList, amountSOL.toFixed(9), childEnv);
         }
       } else {
-        // шаг 3 (sell): баланс токена → доля → котировка в SOL → продаём ExactOut
-        const mintPk = new PublicKey(tokenMint);
-        const raw = await getTokenBalanceRaw(connection, wallet.publicKey, mintPk);
-        if (raw <= 0n) {
+        // === ИЗМЕНЕНО: продаём случайный токен ИЗ ФАКТИЧЕСКИХ БАЛАНСОВ КОШЕЛЬКА (ExactIn) ===
+        // Получаем все SPL-счета кошелька и агрегируем суммы по mint
+        const list = await connection.getTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
+        const byMint = new Map<string, bigint>();
+        for (const acc of list.value) {
+          const info = AccountLayout.decode(acc.account.data);
+          const amount = BigInt(info.amount.toString());
+          if (amount > 0n) {
+            const mintStr = new PublicKey(info.mint).toBase58();
+            if (mintStr === WSOL_MINT) continue; // пропускаем WSOL
+            byMint.set(mintStr, (byMint.get(mintStr) ?? 0n) + amount);
+          }
+        }
+
+        const candidates = Array.from(byMint.entries()); // [mint, totalAmount]
+        if (candidates.length === 0) {
           console.log('💤 Skip: no token balance.');
         } else {
+          // случайный токен из фактических остатков
+          const [sellMint, totalRaw] = candidates[Math.floor(Math.random() * candidates.length)];
           const frac = randBetween(0.1, 0.4); // 10–40% баланса
-          const sellRaw = BigInt(Math.max(1, Math.floor(Number(raw) * frac)));
-          // Считаем сколько SOL за это получим
-          let outLamports = await quoteTokenToSolLamports(tokenMint, sellRaw);
-          // Возьмём 95% от котировки на ExactOut, чтобы точно хватило токенов
-          outLamports = Math.max(100_000, Math.floor(outLamports * 0.95)); // минимум 0.0001 SOL
-          const amountSOL = outLamports / 1e9;
-          console.log(`💸 Selling ~${(Number(sellRaw)).toLocaleString()} raw units for ~${amountSOL.toFixed(6)} SOL…`);
-          await runTradeScript('sell', tokenMint, Number(amountSOL.toFixed(9)));
+          const sellRaw = BigInt(Math.max(1, Math.floor(Number(totalRaw) * frac)));
+
+          // (опционально) для лога посчитаем примерный выход в SOL по ExactIn
+          let approxOutLamports = 0;
+          try {
+            approxOutLamports = await quoteTokenToSolLamports(sellMint, sellRaw);
+          } catch {}
+          const approxOutSol = approxOutLamports / 1e9;
+
+          console.log(`💸 Selling ~${(Number(sellRaw)).toLocaleString()} raw units of ${sellMint.slice(0,8)}… (ExactIn). ~${approxOutSol.toFixed(6)} SOL expected by quote…`);
+
+          // Передаём в trade_token ИМЕННО raw-количество токена (строкой!)
+          await runTradeScript('sell', sellMint, sellRaw.toString(), childEnv);
         }
       }
     } catch (e: any) {
