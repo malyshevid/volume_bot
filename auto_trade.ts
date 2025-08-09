@@ -15,6 +15,9 @@ import { AccountLayout, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const TRADE_SCRIPT = path.resolve(__dirname, 'trade_token.ts'); // наш предыдущий скрипт
 
+// 🎯 целевой токен (20% приоритета)
+const TARGET_MINT = 'LikeUK3Ws7JVmHpZNa15r8Ct1PyScHtFARNzwbttZ1k';
+
 // RPC список (как в trade_token.ts)
 const RPC_LIST = [
   process.env.HELIUS_KEY && `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_KEY}`,
@@ -160,7 +163,7 @@ function resolveTsNodeBin(): string {
   return process.platform === 'win32' ? 'ts-node.cmd' : 'ts-node';
 }
 
-// ⬇️ изменено: amount теперь строка (для SELL передаём raw-кол-во токена)
+// ⬇️ amount — строка (для SELL передаём raw-кол-во токена)
 function runTradeScript(op: 'buy' | 'sell', tokenMint: string, amount: string, envExtras: Record<string, string>): Promise<void> {
   return new Promise((resolve, reject) => {
     const tsNodeBin = resolveTsNodeBin();
@@ -190,14 +193,17 @@ async function mainLoop() {
       // шаг 1: действие
       const op: 'buy' | 'sell' = Math.random() < 0.5 ? 'buy' : 'sell';
 
-      // шаг 2: токен (используется для BUY; для SELL ниже возьмём реальный из кошелька)
-      const tokenMintFromList = tokens[Math.floor(Math.random() * tokens.length)];
+      // шаг 2 (обновлено): выбор токена для BUY с 20% шансом на TARGET_MINT
+      const useTargetForBuy = Math.random() < 0.2;
+      const tokenMintForBuy = useTargetForBuy
+        ? TARGET_MINT
+        : tokens[Math.floor(Math.random() * tokens.length)];
 
       // шаг 0.5: выбираем кошелёк из wallets.txt
       const walletRaw = wallets[Math.floor(Math.random() * wallets.length)];
       const wallet = parseKeypairFromString(walletRaw);
       const pub = wallet.publicKey.toBase58();
-      console.log(`\n=== ${new Date().toISOString()} | ${op.toUpperCase()} | ${tokenMintFromList.slice(0, 8)}... | WALLET ${pub.slice(0,8)}… ===`);
+      console.log(`\n=== ${new Date().toISOString()} | ${op.toUpperCase()} | ${tokenMintForBuy.slice(0, 8)}... | WALLET ${pub.slice(0,8)}… ===`);
 
       // Настраиваем прокси (SOAX rotating)
       const { proxyUrl, session } = buildProxyUrl(pub);
@@ -210,7 +216,7 @@ async function mainLoop() {
       };
 
       if (op === 'buy') {
-        // баланс SOL -> доля -> покупка (токен из tokens.txt)
+        // баланс SOL -> доля -> покупка (токен по логике 20%/80%)
         const balLamports = await connection.getBalance(wallet.publicKey);
         const feeBuffer = 300_000; // ~0.0003 SOL на комиссии
         const available = Math.max(0, balLamports - feeBuffer);
@@ -221,11 +227,10 @@ async function mainLoop() {
           const spendLamports = Math.max(500_000, Math.floor(available * frac)); // ≥ 0.0005 SOL
           const amountSOL = spendLamports / 1e9;
           console.log(`💰 Buying for ~${amountSOL.toFixed(6)} SOL (balance ${(balLamports/1e9).toFixed(6)} SOL)…`);
-          await runTradeScript('buy', tokenMintFromList, amountSOL.toFixed(9), childEnv);
+          await runTradeScript('buy', tokenMintForBuy, amountSOL.toFixed(9), childEnv);
         }
       } else {
-        // === ИЗМЕНЕНО: продаём случайный токен ИЗ ФАКТИЧЕСКИХ БАЛАНСОВ КОШЕЛЬКА (ExactIn) ===
-        // Получаем все SPL-счета кошелька и агрегируем суммы по mint
+        // === ПРОДАЖА: приоритет 20% на TARGET_MINT, но если его нет на кошельке — продаём любой имеющийся ===
         const list = await connection.getTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
         const byMint = new Map<string, bigint>();
         for (const acc of list.value) {
@@ -242,8 +247,20 @@ async function mainLoop() {
         if (candidates.length === 0) {
           console.log('💤 Skip: no token balance.');
         } else {
-          // случайный токен из фактических остатков
-          const [sellMint, totalRaw] = candidates[Math.floor(Math.random() * candidates.length)];
+          let sellMint: string;
+          let totalRaw: bigint;
+
+          if (Math.random() < 0.2 && byMint.has(TARGET_MINT)) {
+            // 20% шанс и целевой токен есть на кошельке — продаём его
+            sellMint = TARGET_MINT;
+            totalRaw = byMint.get(TARGET_MINT)!;
+          } else {
+            // иначе — случайный из имеющихся
+            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            sellMint = pick[0];
+            totalRaw = pick[1];
+          }
+
           const frac = randBetween(0.1, 0.4); // 10–40% баланса
           const sellRaw = BigInt(Math.max(1, Math.floor(Number(totalRaw) * frac)));
 
