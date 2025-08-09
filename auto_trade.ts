@@ -14,6 +14,7 @@ import { AccountLayout, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const TRADE_SCRIPT = path.resolve(__dirname, 'trade_token.ts'); // наш предыдущий скрипт
+const CHECK_PROXY_SCRIPT = path.resolve(__dirname, 'check_proxy_ip.ts');
 
 // 🎯 целевой токен (20% приоритета)
 const TARGET_MINT = 'LikeUK3Ws7JVmHpZNa15r8Ct1PyScHtFARNzwbttZ1k';
@@ -183,6 +184,28 @@ function runTradeScript(op: 'buy' | 'sell', tokenMint: string, amount: string, e
   });
 }
 
+function runCheckProxyIp(proxyUrl: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const tsNodeBin = resolveTsNodeBin();
+    const child = spawn(tsNodeBin, [CHECK_PROXY_SCRIPT], {
+      stdio: 'inherit',
+      shell: true,
+      env: { ...process.env, HTTPS_PROXY: proxyUrl },
+    });
+    child.on('exit', code => resolve(code === 0));
+    child.on('error', reject);
+  });
+}
+
+async function ensureProxyIpChanged(proxyUrl: string) {
+  while (true) {
+    const changed = await runCheckProxyIp(proxyUrl);
+    if (changed) return;
+    console.log('🔄 Proxy IP not changed. Waiting 30s before retry...');
+    await new Promise(r => setTimeout(r, 30_000));
+  }
+}
+
 async function mainLoop() {
   const connection = await getConnection();
   const tokens = readTokens();
@@ -227,6 +250,7 @@ async function mainLoop() {
           const spendLamports = Math.max(500_000, Math.floor(available * frac)); // ≥ 0.0005 SOL
           const amountSOL = spendLamports / 1e9;
           console.log(`💰 Buying for ~${amountSOL.toFixed(6)} SOL (balance ${(balLamports/1e9).toFixed(6)} SOL)…`);
+          await ensureProxyIpChanged(proxyUrl);
           await runTradeScript('buy', tokenMintForBuy, amountSOL.toFixed(9), childEnv);
         }
       } else {
@@ -274,6 +298,7 @@ async function mainLoop() {
           console.log(`💸 Selling ~${(Number(sellRaw)).toLocaleString()} raw units of ${sellMint.slice(0,8)}… (ExactIn). ~${approxOutSol.toFixed(6)} SOL expected by quote…`);
 
           // Передаём в trade_token ИМЕННО raw-количество токена (строкой!)
+          await ensureProxyIpChanged(proxyUrl);
           await runTradeScript('sell', sellMint, sellRaw.toString(), childEnv);
         }
       }
